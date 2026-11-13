@@ -1,4 +1,5 @@
 # .workflow.toml: read by `wf` (agent-workflow). Commit it at the repo root.
+api = "{{API}}"   # rest | graphql: which GitHub API the agents may use; see the README's "REST or GraphQL"
 
 [board]
 owner = "{{OWNER}}"         # the board owner's login
@@ -42,6 +43,17 @@ deploy_prefix = "deploy:"
 # engine = "claude"          # or "opencode" (2.1+): the wf-review recipe under opencode
 # opencode_model = "anthropic/claude-sonnet-5-5"
 # lane_model = "anthropic/claude-haiku-4-5"
+# [review.tiers]            # the wf-review lanes per tier; `name?` runs only when its lane's gate holds
+#                            # each lane is a subagent run and adds to every review's spend
+# light = ["correctness", "reuse"]
+# standard = ["correctness", "spec?", "reuse", "history?"]
+# deep = ["correctness", "spec?", "reuse", "history"]
+# fix = ["correctness"]
+# [review.lanes.security]   # a new lane, or a built-in name to override any of its keys
+# brief = "find injection, authorization and secret-handling bugs the change introduces"
+# when = "always"            # always | issue_or_claude_md | history
+# model = "opus"             # Claude recipe: sonnet | opus | haiku | fable
+# opencode_model = "anthropic/claude-opus-5-5"  # opencode engine: provider/model
 
 # [gate]                    # `wf gate`: the local gate, one line per step, full logs in .git/wf-gate/
 # steps = ["dotnet format --verify-no-changes", "dotnet test"]

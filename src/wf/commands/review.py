@@ -36,6 +36,7 @@ built-in /code-review cannot be pointed at a range of commits.
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -46,7 +47,7 @@ from pathlib import Path
 
 from .. import ledger
 from ..cache import prune
-from ..config import ENGINES, LEVELS
+from ..config import ASSETS, ENGINES, LEVELS, review_prep
 from ..gh import common_dir, run_git
 from ..opencode import MARKER, export_session, opencode_result, opencode_version, require_opencode
 from . import UsageError, WfError, closing_refs, frontmatter_stripped
@@ -59,19 +60,11 @@ DEFAULTS = {"level": "high", "model": "opus", "budget_usd": 6, "engine": "claude
 ISOLATION = ("--setting-sources", "", "--settings", json.dumps({"enabledPlugins": {"wf-review@agent-workflow": True}}),
              "--strict-mcp-config")
 TIMEOUT = 45 * 60  # seconds one `claude -p` run may take
-ASSETS = Path(__file__).resolve().parent.parent / "review_assets"
 # opencode has no budget cap; these bound each agent's model turns instead.
 ORCHESTRATOR_STEPS, LANE_STEPS = 40, 25
-# What each tier means per engine: the built-in's effort level, and the opencode lanes ("history" runs in
-# standard only when prep finds history to read). A fix round is its own shape: correctness on the new commits.
-TIERS = {
-    "light": {"level": "medium", "lanes": ("correctness", "reuse")},
-    "standard": {"level": None, "lanes": ("correctness", "spec", "reuse", "history?")},
-    "deep": {"level": "xhigh", "lanes": ("correctness", "spec", "reuse", "history")},
-}
-SIZE_TIERS = {"XS": "light", "S": "light", "M": "standard", "L": "deep", "XL": "deep"}
-DIFF_TIERS = ((150, "light"), (800, "standard"))  # changed lines → tier, for a PR with no sized issue
-FIX_LANES = ("correctness",)
+# The built-in's effort level per tier. The wf-review recipe's lanes per tier (and a fix round's) are resolved by
+# review_prep.py, from [review.tiers] and [review.lanes], and read from its prep.json.
+TIERS = {"light": {"level": "medium"}, "standard": {"level": None}, "deep": {"level": "xhigh"}}
 # What a review needs and nothing that writes to the checkout.
 READ_TOOLS = (
     "Read", "Grep", "Glob", "Agent", "Task",
@@ -85,7 +78,10 @@ ALLOWED_TOOLS = READ_TOOLS + POST_TOOLS
 # Deny beats allow, and `*` matches anywhere: the git commands above stay read-only (`--output=<file>` writes
 # a file; git accepts no abbreviation of it), and ast-grep cannot rewrite files.
 DENIED_TOOLS = ("Bash(git * --output*)", "Bash(ast-grep * -U*)", "Bash(ast-grep * --update-all*)",
-                "Bash(ast-grep * -i*)", "Bash(ast-grep * --interactive*)")
+                "Bash(ast-grep * -i*)", "Bash(ast-grep * --interactive*)",
+                # --web/-w opens a browser on the reviewer's machine
+                "Bash(gh pr view *--web*)", "Bash(gh pr view *-w*)",
+                "Bash(gh issue view *--web*)", "Bash(gh issue view *-w*)")
 _ORIGIN = re.compile(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?$")
 
 
@@ -221,6 +217,7 @@ def settings(cfg, args):
         s["budget_usd"] = args.budget
     if args.engine:
         s["engine"] = args.engine
+    s["api"] = cfg.api
     if s["engine"] == "opencode":
         if args.lean or args.level or args.budget is not None:
             raise UsageError("--lean, --level and --budget apply to the claude engine; opencode runs the wf-review recipe")
@@ -239,22 +236,21 @@ def settings(cfg, args):
 
 
 def choose_tier(s, args, gh, repo, issue, pr, size_prefix):
-    """(tier, why) from --tier, else from the linked issue's size label or the diff size when tiered; else (None, None)."""
+    """(tier, why) from --tier, else from the linked issue's size label or the diff size when tiered (review_prep's
+    tier_by_size, the rule a standalone prep applies); else (None, None)."""
     if args.tier:
         return args.tier, "--tier"
     if not s.get("tiered"):
         return None, None
+    labels = []
     if issue:
         try:
             labels = [x.get("name", "") for x in gh.get(f"/repos/{repo}/issues/{issue}").get("labels") or []]
         except WfError:
-            labels = []
-        size = next((x[len(size_prefix):] for x in labels if x.startswith(size_prefix)), None)
-        if size in SIZE_TIERS:
-            return SIZE_TIERS[size], f"#{issue} is {size}"
+            pass
     lines = (pr.get("additions") or 0) + (pr.get("deletions") or 0)
-    tier = next((t for limit, t in DIFF_TIERS if lines <= limit), "deep")
-    return tier, f"{lines} changed lines"
+    tier, size = review_prep().tier_by_size(labels, size_prefix, lines)
+    return tier, f"#{issue} is {size}" if size else f"{lines} changed lines"
 
 
 def _state_path(keep, n):
@@ -281,18 +277,6 @@ def _record(keep, n, head, kept, variant):
     """What --since last reads: the head this review saw and where its text is kept."""
     keep.mkdir(parents=True, exist_ok=True)
     _state_path(keep, n).write_text(json.dumps({"head": head, "review": str(kept), "variant": variant}) + "\n")
-
-
-def _lanes(tier, since, prep_file):
-    if since:
-        return FIX_LANES
-    history = False
-    try:
-        history = bool(json.loads(Path(prep_file).read_text()).get("history_lane"))
-    except (OSError, json.JSONDecodeError):
-        pass
-    lanes = TIERS[tier or "standard"]["lanes"]
-    return tuple(x.rstrip("?") for x in lanes if not x.endswith("?") or history)
 
 
 def usage_tokens(result):
@@ -347,24 +331,29 @@ def rules(action, *pairs):
     return [{"action": action, "resource": resource, "effect": effect} for resource, effect in pairs]
 
 
-def _permissions(task, tree):
-    """Read anything in the checkout, a few read-only git and REST commands, nothing else. A rule
-    set to `ask` auto-rejects in a headless run and ends it, so everything is allow or deny. The
-    last matching rule wins, so each exception follows the rule it narrows."""
+def _permissions(launches, tree, api):
+    """Read anything in the checkout, a few read-only git and REST commands, and launch the subagents named in
+    `launches`; nothing else. A rule set to `ask` auto-rejects in a headless run and ends it, so everything is
+    allow or deny. The last matching rule wins, so each exception follows the rule it narrows."""
+    graphql = api == "graphql"  # adds the read-only gh pr/issue views; raw gh api graphql stays denied in both modes
     data = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
     return [
         *rules("*", ("*", "deny")),
         *rules("read", ("*", "allow")), *rules("grep", ("*", "allow")), *rules("glob", ("*", "allow")),
-        *rules("shell", ("*", "deny"), ("gh api *", "allow"), ("git log *", "allow"), ("git blame *", "allow"),
+        *rules("shell", ("*", "deny"), ("gh api *", "allow"),
+               *((("gh pr view *", "allow"), ("gh pr diff *", "allow"), ("gh issue view *", "allow")) if graphql else ()),
+               ("git log *", "allow"), ("git blame *", "allow"),
                ("git show *", "allow"), ("git diff *", "allow"), ("ast-grep run *", "allow"),
-               # gh api writes and GraphQL are denied after the allow
+               # gh api writes and raw GraphQL (a glob cannot tell a query from a mutation) are denied after the allow, in both modes
                ("gh api graphql*", "deny"), ("gh api *-X*", "deny"), ("gh api *--method*", "deny"),
                ("gh api * -f*", "deny"), ("gh api * -F*", "deny"), ("gh api *--field*", "deny"),
                ("gh api *--raw-field*", "deny"), ("gh api *--input*", "deny"),
                ("git *--output*", "deny"),  # diff options write a file
                ("ast-grep *-U*", "deny"), ("ast-grep *--update-all*", "deny"), ("ast-grep * -i*", "deny"),
-               ("ast-grep *--interactive*", "deny")),
-        *rules("subagent", ("*", "deny"), *((("wf-review-lane", "allow"),) if task else ())),
+               ("ast-grep *--interactive*", "deny"),
+               ("gh pr view *--web*", "deny"), ("gh pr view *-w*", "deny"),
+               ("gh issue view *--web*", "deny"), ("gh issue view *-w*", "deny")),
+        *rules("subagent", ("*", "deny"), *((agent, "allow") for agent in launches)),
         # opencode's own spill files for long tool output
         *rules("external_directory", ("*", "deny"), (f"{tree}/*", "allow"),
                (f"{data}/opencode/tool-output/*", "allow"), (f"{tempfile.gettempdir()}/opencode/*", "allow")),
@@ -377,38 +366,60 @@ def house_rules(tree):
     return [str(root / "CLAUDE.md")] if (root / "CLAUDE.md").is_file() and not (root / "AGENTS.md").is_file() else []
 
 
-def opencode_config(s, tree):
-    """The two agents, passed inline (OPENCODE_CONFIG_CONTENT) so nothing is written to the checkout."""
-    lane = {"description": "One lane of a wf-review (correctness, spec or history); returns rated findings.",
-            "mode": "subagent", "steps": LANE_STEPS, "permissions": _permissions(task=False, tree=tree),
+def lane_agents(s, lanes):
+    """(lane agent → model or None, [(lane name, agent)]): `wf-review-lane` has the default lane model and runs
+    every lane with no opencode_model of its own; each other distinct opencode_model gets `wf-review-lane-1`,
+    `wf-review-lane-2`, … in the order the lanes first name it."""
+    agents, by_model, assigned = {"wf-review-lane": s["lane_model"]}, {s["lane_model"]: "wf-review-lane"}, []
+    for lane in lanes:
+        model = lane.get("opencode_model") or s["lane_model"]
+        if model not in by_model:
+            by_model[model] = f"wf-review-lane-{len(agents)}"
+            agents[by_model[model]] = model
+        assigned.append((lane["name"], by_model[model]))
+    return agents, assigned
+
+
+def opencode_config(s, tree, lanes):
+    """The orchestrator and one lane agent per distinct lane model (lane_agents), passed inline
+    (OPENCODE_CONFIG_CONTENT) so nothing is written to the checkout."""
+    models, _ = lane_agents(s, lanes)
+    lane = {"description": "One lane of a wf-review; returns rated findings.",
+            "mode": "subagent", "steps": LANE_STEPS, "permissions": _permissions((), tree=tree, api=s["api"]),
             "system": frontmatter_stripped((ASSETS / "review-lane.md").read_text())}
-    if s["lane_model"]:
-        lane["model"] = s["lane_model"]
     return {"$schema": "https://opencode.ai/config.json",
             "instructions": house_rules(tree),
             "agents": {"wf-review": {"description": "Orchestrates a wf-review of one pull request.",
                                      "mode": "primary", "model": s["opencode_model"], "steps": ORCHESTRATOR_STEPS,
-                                     "permissions": _permissions(task=True, tree=tree),
+                                     "permissions": _permissions(tuple(models), tree=tree, api=s["api"]),
                                      "system": (ASSETS / "opencode-review.md").read_text()},
-                       "wf-review-lane": lane}}
+                       **{agent: {**lane, **({"model": model} if model else {})} for agent, model in models.items()}}}
 
 
-def _run_opencode(s, runner, gh, repo, n, tree, head, post, keep, tier=None, why=None, since=None, previous=None,
-                  branch=None):
+def _run_opencode(s, runner, gh, repo, n, tree, head, post, keep, config, tier=None, why=None, since=None,
+                  previous=None, branch=None):
     # opencode resolves symlinks (macOS /var → /private/var); an unresolved path reads as outside the project
     tree = str(Path(tree).resolve())
     argv = [str(n), "--repo", repo, "--dir", str(Path(tree) / ".wf-review"), "--force"]
     if since:
         argv += ["--since", since] + (["--previous", previous] if previous and Path(previous).is_file() else [])
+    elif tier:
+        argv += ["--tier", tier]
+    argv += ["--config", config, "--api", s["api"]]
     prep = runner.prep(argv, cwd=tree)
-    lanes = _lanes(tier, since, prep)
-    env = {"OPENCODE_CONFIG_CONTENT": json.dumps(opencode_config(s, tree)),
+    try:
+        lanes = json.loads(Path(prep).read_text())["lanes"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        raise WfError(f"review prep wrote no lanes to {prep}") from None
+    _, assigned = lane_agents(s, lanes)
+    env = {"OPENCODE_CONFIG_CONTENT": json.dumps(opencode_config(s, tree, lanes)),
            # the repo's AGENTS.md, or its CLAUDE.md (see house_rules), loads; the user's Claude skills do not
            "OPENCODE_DISABLE_CLAUDE_CODE_SKILLS": "1"}
     # --standalone: the shared background service would ignore OPENCODE_CONFIG_CONTENT
     argv = ["run", "--standalone", "--format", "json", "--agent", "wf-review", "-m", s["opencode_model"],
             "--title", f"wf-review {repo}#{n}",
-            f"Review pull request #{n} of {repo}. The prep file is {prep}. Lanes: {', '.join(lanes)}."
+            f"Review pull request #{n} of {repo}. The prep file is {prep}. "
+            f"Lanes: {', '.join(f'{name} ({agent})' for name, agent in assigned)}."
             + (f" This is a fix round: the commits since {since[:12]}." if since else "")]
     start = time.monotonic()
     events = runner.opencode(argv, cwd=tree, env=env)
@@ -436,8 +447,8 @@ def _run_opencode(s, runner, gh, repo, n, tree, head, post, keep, tier=None, why
     yield (f"#{n}: {'wf-review posted' if post else 'findings below'} ({_shape(tier, why, since)}"
            f"opencode {s['opencode_model']}, lanes {lane_model}), {_spent(u)}"
            + (f"; {len(result['subagent_stats']['unpriced'])} lane(s) unpriced" if result["subagent_stats"]["unpriced"] else ""),
-           {"pr": n, "variant": variant, "tier": tier, "since": since, "lanes": list(lanes), "posted": post,
-            "head": head, **u, "kept": str(kept)})
+           {"pr": n, "variant": variant, "tier": tier, "since": since, "lanes": [x["name"] for x in lanes],
+            "posted": post, "head": head, **u, "kept": str(kept)})
     if not post:
         yield result["result"], {"pr": n, "variant": variant, "text": result["result"]}
 
@@ -476,12 +487,12 @@ def _check_posted(gh, repo, n, started, result, what, kept):
                   + f". The review is in {kept}: post it with `gh pr comment {n} --body-file {kept}`")
 
 
-def _run_fix_round(runner, gh, repo, n, tree, head, post, keep, since, previous, common, branch=None):
+def _run_fix_round(s, runner, gh, repo, n, tree, head, post, keep, since, previous, common, config, branch=None):
     """The Claude engine's fix round: the wf-review plugin with --since (the built-in takes no commit range)."""
     out = ".wf-review-fix.md"
     slash = (f"/wf-review:review {n} --since {since}"
              + (f" --previous {previous}" if previous and Path(previous).is_file() else "")
-             + ("" if post else f" --no-post --out {out}"))
+             + ("" if post else f" --no-post --out {out}") + f" --config {shlex.quote(config)} --api {s['api']}")
     started = _now()
     result = runner.claude(["-p", slash, *common, "Write"], cwd=tree)
     kept = _keep(keep, n, "lean-fix", result, branch)
@@ -515,6 +526,8 @@ def run(args, cfg, board):
     since, previous = resolve_since(args, keep, n)
     tier, why = (None, None) if since else choose_tier(s, args, board.gh, repo, issue, pr, cfg.labels["size_prefix"])
     level = args.level or (TIERS[tier]["level"] if tier else None) or s["level"]
+    # prep runs in the PR's worktree, so it is told which config file wf read
+    config = os.path.abspath(cfg.path)
 
     scratch = runner.tempdir()
     tree = str(Path(scratch) / f"pr-{n}")
@@ -529,8 +542,8 @@ def run(args, cfg, board):
             return
         runner.git("worktree", "add", "-q", "--detach", tree, head)
         if s["engine"] == "opencode":
-            yield from _run_opencode(s, runner, board.gh, repo, n, tree, head, post, keep, tier, why, since, previous,
-                                     branch)
+            yield from _run_opencode(s, runner, board.gh, repo, n, tree, head, post, keep, config, tier, why, since,
+                                     previous, branch)
             return
         changed = runner.git("diff", "--name-only", f"{pr['base']['sha']}...{head}", cwd=tree).splitlines()
         prompt = system_prompt(repo, n, issue, claude_md_paths(tree, changed))
@@ -539,8 +552,8 @@ def run(args, cfg, board):
                   "--max-budget-usd", str(s["budget_usd"]), "--append-system-prompt", prompt,
                   *ISOLATION, "--disallowedTools", *DENIED_TOOLS, "--allowedTools", *(ALLOWED_TOOLS if post else READ_TOOLS)]
         if since:
-            yield from _run_fix_round(runner, board.gh, repo, n, tree, head, post, keep, since, previous, common,
-                                      branch)
+            yield from _run_fix_round(s, runner, board.gh, repo, n, tree, head, post, keep, since, previous, common,
+                                      config, branch)
             return
         slash = f"/code-review {n} {level}" + (" --comment" if post else "")
         started = _now()
@@ -560,7 +573,8 @@ def run(args, cfg, board):
             yield str(result.get("result") or "").rstrip(), {"pr": n, "variant": "builtin", "text": result.get("result")}
 
         if args.lean:
-            slash = f"/wf-review:review {n}" + (" --no-post --out .wf-review-lean.md" if args.no_post else "")
+            slash = (f"/wf-review:review {n}" + (" --no-post --out .wf-review-lean.md" if args.no_post else "")
+                     + f" --config {shlex.quote(config)}" + (f" --tier {tier}" if tier else "") + f" --api {s['api']}")
             started = _now()
             result = runner.claude(["-p", slash, *common, "Write"], cwd=tree)
             kept = _keep(keep, n, "lean", result, branch)

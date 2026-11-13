@@ -1,4 +1,6 @@
 import json
+import os
+import re
 import subprocess
 import tempfile
 import unittest
@@ -7,6 +9,7 @@ from unittest import mock
 
 from tests.fake_gh import FakeGh, run
 from wf.commands import review
+from wf.config import review_prep
 from wf.gh import WfError
 
 OK = {"is_error": False, "terminal_reason": "completed", "num_turns": 9, "total_cost_usd": 2.3777,
@@ -93,8 +96,18 @@ class FakeRunner:
         return self.results.pop(0)
 
     def prep(self, argv, cwd):
+        """Writes the prep.json lanes the real prep would for its --tier/--since and --config, with an issue and no
+        history to read."""
         self.calls.append(("prep", *argv))
-        self.prep_cwd = cwd
+        self.prep_cwd, self.wf_config = cwd, os.environ.get("WF_CONFIG")
+        rp = review_prep()
+        tier = "fix" if "--since" in argv else argv[argv.index("--tier") + 1] if "--tier" in argv else "standard"
+        _, cfg = rp._load_config(argv[argv.index("--config") + 1]) if "--config" in argv else (None, {})
+        lanes = rp.resolve_lanes(cfg.get("review", {}), tier,
+                                 {"always": True, "issue_or_claude_md": True, "history": False})
+        out = Path(cwd) / ".wf-review"
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "prep.json").write_text(json.dumps({"tier": tier, "lanes": lanes}))
         return f"{cwd}/.wf-review/prep.json"
 
     def opencode(self, argv, cwd, env):
@@ -116,6 +129,8 @@ class FakeRunner:
         self.removed.append(path)
 
 
+WEB_DENIES = [("gh pr view *--web*", "deny"), ("gh pr view *-w*", "deny"),
+              ("gh issue view *--web*", "deny"), ("gh issue view *-w*", "deny")]
 PR = "/repos/acme/web"
 COMMENT_LISTS = (f"{PR}/pulls/12/reviews", f"{PR}/pulls/12/comments", f"{PR}/issues/12/comments")
 
@@ -370,7 +385,8 @@ class ReviewTest(unittest.TestCase):
         self.assertEqual(out.splitlines()[:2], ["#12: findings below, $2.38 (90k, +1900k cache)", "1. A finding."])
         self.assertEqual(self.claude_call(0)[2], "/code-review 12 high")
         second = self.claude_call(1)
-        self.assertEqual(second[2], "/wf-review:review 12 --no-post --out .wf-review-lean.md")
+        self.assertEqual(re.sub(r" --config \S+", "", second[2]),
+                         "/wf-review:review 12 --no-post --out .wf-review-lean.md --api rest")
         self.assertEqual(second[-1], "Write")
         self.assertIn("#12: wf-review written, $1.50", out)
         self.assertTrue((Path(self.runner.git_dir) / "wf-review" / "pr-12-lean.json").is_file())
@@ -408,8 +424,9 @@ class OpencodeTest(unittest.TestCase):
         self.assertEqual(out, "#12: wf-review posted (opencode anthropic/claude-sonnet-5-5, "
                               "lanes anthropic/claude-sonnet-5-5), $0.65 (50k, +200k cache)\n")
         tree = str(Path(self.runner.dir).resolve() / "pr-12")
-        self.assertIn(("prep", "12", "--repo", "acme/web", "--dir", f"{tree}/.wf-review", "--force"),
-                      self.runner.calls)
+        p = next(c for c in self.runner.calls if c[0] == "prep")
+        self.assertEqual(p[:7] + p[-4:], ("prep", "12", "--repo", "acme/web", "--dir", f"{tree}/.wf-review",
+                                          "--force", "--config", self.runner.wf_config, "--api", "rest"))
         self.assertEqual((self.runner.prep_cwd, self.runner.cwd), (tree, tree))
         self.assertIn({"action": "external_directory", "resource": f"{tree}/*", "effect": "allow"},
                       self.config()["agents"]["wf-review"]["permissions"])
@@ -437,6 +454,63 @@ class OpencodeTest(unittest.TestCase):
         (tree / "AGENTS.md").write_text("opencode loads this itself.")
         run(["review", "12", "--engine", "opencode"], with_pr(FakeGh()))
         self.assertEqual(self.config()["instructions"], [])
+
+    def shell_rules(self, api):
+        run(["review", "12", "--engine", "opencode"], with_pr(FakeGh()), api=api)
+        agents = self.config()["agents"]
+        return [[(r["resource"], r["effect"]) for r in a["permissions"] if r["action"] == "shell"]
+                for a in agents.values()]
+
+    def test_opencode_denies_graphql_in_rest_mode(self):
+        for rules in self.shell_rules("rest"):
+            self.assertIn(("gh api graphql*", "deny"), rules)
+
+    def test_opencode_graphql_mode_adds_gh_views_and_keeps_raw_graphql_denied(self):
+        for rules in self.shell_rules("graphql"):
+            self.assertIn(("gh api graphql*", "deny"), rules)
+            for read in ("gh pr view *", "gh pr diff *", "gh issue view *"):
+                self.assertIn((read, "allow"), rules)
+            self.assertIn(("gh api *-X*", "deny"), rules)
+            self.assertIn(("gh api * -f*", "deny"), rules)
+            self.assertFalse([r for r in rules if r[0].startswith(("gh pr comment", "gh pr review"))])
+
+    def test_wf_review_passes_api_to_prep(self):
+        for api in ("rest", "graphql"):
+            self.runner.calls.clear()
+            run(["review", "12", "--engine", "opencode"], with_pr(FakeGh()), api=api)
+            self.assertEqual(next(c for c in self.runner.calls if c[0] == "prep")[-2:], ("--api", api))
+        for api, tail in ((None, "--api rest"), ("graphql", "--api graphql")):
+            self.runner.calls.clear()
+            self.runner.results = [OK, OK]
+            run(["review", "12", "--lean", "--no-post"], with_pr(FakeGh()), **({"api": api} if api else {}))
+            self.assertTrue([c for c in self.runner.calls if c[0] == "claude" and c[2].endswith(tail)], api)
+
+    def test_gh_view_web_denied_flag_first(self):
+        # `gh pr view -w 12` (flag before the number) must match the globs too
+        import fnmatch
+        for pattern in ("gh pr view *-w*", "gh issue view *-w*"):
+            for cmd in (pattern.replace("*-w*", "-w 12"), pattern.replace("*-w*", "12 -w")):
+                self.assertTrue(fnmatch.fnmatchcase(cmd, pattern), cmd)
+
+    def test_gh_view_web_denied(self):
+        for tool in ("Bash(gh pr view *--web*)", "Bash(gh pr view *-w*)",
+                     "Bash(gh issue view *--web*)", "Bash(gh issue view *-w*)"):
+            self.assertIn(tool, review.DENIED_TOOLS)
+        for api in ("rest", "graphql"):
+            for rules in self.shell_rules(api):
+                self.assertEqual(rules[-4:], WEB_DENIES)
+
+    def test_opencode_rest_rules_unchanged(self):
+        today = [("*", "deny"), ("gh api *", "allow"), ("git log *", "allow"), ("git blame *", "allow"),
+                 ("git show *", "allow"), ("git diff *", "allow"), ("ast-grep run *", "allow"),
+                 ("gh api graphql*", "deny"), ("gh api *-X*", "deny"), ("gh api *--method*", "deny"),
+                 ("gh api * -f*", "deny"), ("gh api * -F*", "deny"), ("gh api *--field*", "deny"),
+                 ("gh api *--raw-field*", "deny"), ("gh api *--input*", "deny"),
+                 ("git *--output*", "deny"),
+                 ("ast-grep *-U*", "deny"), ("ast-grep *--update-all*", "deny"), ("ast-grep * -i*", "deny"),
+                 ("ast-grep *--interactive*", "deny"), *WEB_DENIES]
+        for rules in self.shell_rules("rest"):
+            self.assertEqual(rules, today)
 
     def test_the_agents_read_only_and_only_the_orchestrator_launches_lanes(self):
         run(["review", "12", "--engine", "opencode", "--lane-model", "anthropic/claude-haiku-4-5"], with_pr(FakeGh()))
@@ -469,6 +543,31 @@ class OpencodeTest(unittest.TestCase):
             self.assertEqual(of(perms, "external_directory")[0], ("*", "deny"))
         self.assertEqual(self.runner.env["OPENCODE_DISABLE_CLAUDE_CODE_SKILLS"], "1")
         self.assertNotIn("OPENCODE_DISABLE_CLAUDE_CODE_PROMPT", self.runner.env)
+
+    def test_opencode_agent_per_lane_model(self):
+        lanes = ('[review.lanes.security]\nbrief = "Find injection."\nopencode_model = "anthropic/claude-opus-5-5"\n'
+                 '[review.lanes.perf]\nbrief = "Find slow paths."\nopencode_model = "openai/gpt-6"\n'
+                 '[review.lanes.style]\nbrief = "Find style drift."\nopencode_model = "anthropic/claude-opus-5-5"\n'
+                 '[review.tiers]\nstandard = ["correctness", "security", "perf", "reuse", "style"]\n')
+        code, _, err = run(["review", "12", "--engine", "opencode", "--no-post", "--lane-model",
+                            "anthropic/claude-haiku-4-5"], with_pr(FakeGh()), review=lanes)
+        self.assertEqual((code, err), (0, ""))
+        agents = self.config()["agents"]
+        self.assertEqual({k: v.get("model") for k, v in agents.items() if k != "wf-review"},
+                         {"wf-review-lane": "anthropic/claude-haiku-4-5", "wf-review-lane-1": "anthropic/claude-opus-5-5",
+                          "wf-review-lane-2": "openai/gpt-6"})
+        for name in ("wf-review-lane-1", "wf-review-lane-2"):
+            self.assertEqual({k: v for k, v in agents[name].items() if k != "model"},
+                             {k: v for k, v in agents["wf-review-lane"].items() if k != "model"})
+        self.assertEqual([(r["resource"], r["effect"]) for r in agents["wf-review"]["permissions"]
+                          if r["action"] == "subagent"],
+                         [("*", "deny"), ("wf-review-lane", "allow"), ("wf-review-lane-1", "allow"),
+                          ("wf-review-lane-2", "allow")])
+        self.assertIn("Lanes: correctness (wf-review-lane), security (wf-review-lane-1), perf (wf-review-lane-2), "
+                      "reuse (wf-review-lane), style (wf-review-lane-1).", self.opencode_call()[-1])
+        # without --lane-model the default lane agent has no model of its own (the orchestrator's)
+        self.assertNotIn("model", review.opencode_config({"lane_model": None, "api": "rest", "opencode_model": "a/b"},
+                                                         self.runner.dir, [])["agents"]["wf-review-lane"])
 
     def test_a_lane_launched_in_the_background_fails_the_review_and_posts_nothing(self):
         self.runner.events = [EVENTS[0], _subagent("ses_a", background=True), *EVENTS[3:]]
@@ -575,6 +674,17 @@ def sized(gh, size):
     return gh
 
 
+class ClaudeApiTest(unittest.TestCase):
+    def test_claude_engine_tools_ignore_api(self):
+        def tools(api):
+            runner = FakeRunner()
+            with mock.patch.object(review, "RUNNER", runner):
+                run(["review", "12"], with_pr(FakeGh()), api=api)
+            c = next(c for c in runner.calls if c[0] == "claude")
+            return c[c.index("--disallowedTools"):]
+        self.assertEqual(tools("rest"), tools("graphql"))
+
+
 class TierTest(unittest.TestCase):
     def setUp(self):
         self.runner = FakeRunner()
@@ -621,7 +731,7 @@ class TierTest(unittest.TestCase):
             self.runner.calls.clear()
             run(["review", "12", "--engine", "opencode", "--no-post", *argv], with_pr(FakeGh()))
             message = next(c for c in self.runner.calls if c[0] == "opencode")[-1]
-            self.assertIn(f"Lanes: {lanes}.", message)
+            self.assertIn("Lanes: " + ", ".join(f"{x} (wf-review-lane)" for x in lanes.split(", ")) + ".", message)
 
     def test_the_builtin_is_asked_for_reuse_and_ast_grep_is_allowed(self):
         run(["review", "12", "--no-post"], with_pr(FakeGh()))
@@ -672,9 +782,10 @@ class FixRoundTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("(fix round since old5678; opencode", out)
         prep = next(c for c in self.runner.calls if c[0] == "prep")
-        self.assertEqual(prep[-4:], ("--since", "old5678", "--previous", str(previous)))
+        self.assertEqual(prep[-8:], ("--since", "old5678", "--previous", str(previous), "--config", self.runner.wf_config,
+                                     "--api", "rest"))
         message = next(c for c in self.runner.calls if c[0] == "opencode")[-1]
-        self.assertIn("Lanes: correctness. This is a fix round: the commits since old5678.", message)
+        self.assertIn("Lanes: correctness (wf-review-lane). This is a fix round: the commits since old5678.", message)
         self.assertEqual(json.loads((self.keep / "pr-12-last.json").read_text())["head"], "abc1234")
 
     def test_lean_and_fix_round_sessions_are_isolated(self):
@@ -695,8 +806,9 @@ class FixRoundTest(unittest.TestCase):
         code, out, _ = run(["review", "12", "--since", "old5678", "--no-post"], with_pr(FakeGh()))
         self.assertEqual(code, 0)
         c = self.claude_call()
-        self.assertEqual(c[2], f"/wf-review:review 12 --since old5678 --previous {self.keep / 'pr-12-builtin.md'} "
-                               "--no-post --out .wf-review-fix.md")
+        self.assertEqual(re.sub(r" --config \S+", "", c[2]),
+                         f"/wf-review:review 12 --since old5678 --previous {self.keep / 'pr-12-builtin.md'} "
+                         "--no-post --out .wf-review-fix.md --api rest")
         self.assertEqual(c[-1], "Write")
         self.assertIn("#12: fix-round review below (since old5678), $0.90", out)
         self.assertIn("Previous findings (1)", out)
@@ -710,6 +822,26 @@ class FixRoundTest(unittest.TestCase):
                            with_pr(FakeGh()))
         self.assertEqual(code, 0)
         self.assertEqual([json.loads(x)["variant"] for x in out.splitlines()], ["opencode-fix", "opencode-fix"])
+
+    def test_wf_review_passes_config_and_tier(self):
+        seen = []
+        self.runner.on_claude = lambda: seen.append(os.environ["WF_CONFIG"])
+        run(["review", "12", "--engine", "opencode", "--no-post", "--tier", "deep"], with_pr(FakeGh()))
+        prep = next(c for c in self.runner.calls if c[0] == "prep")
+        self.assertEqual(prep[-6:], ("--tier", "deep", "--config", self.runner.wf_config, "--api", "rest"))
+        self.runner.calls.clear()
+        run(["review", "12", "--engine", "opencode", "--no-post"], with_pr(FakeGh()))
+        self.assertNotIn("--tier", next(c for c in self.runner.calls if c[0] == "prep"))  # untiered: prep's standard
+        self.runner.calls.clear()
+        self.runner.results = [OK, OK]
+        run(["review", "12", "--no-post", "--lean", "--tier", "light"], with_pr(FakeGh()))
+        self.assertEqual(self.claude_call(1)[2], "/wf-review:review 12 --no-post --out .wf-review-lean.md "
+                                                 f"--config {seen[-1]} --tier light --api rest")
+        self.runner.calls.clear()
+        self.runner.results = [OK]
+        run(["review", "12", "--since", "old5678", "--no-post"], with_pr(FakeGh()))
+        self.assertEqual(self.claude_call()[2], "/wf-review:review 12 --since old5678 --no-post --out .wf-review-fix.md "
+                                                f"--config {seen[-1]} --api rest")
 
     def test_since_and_lean_together_is_a_usage_error(self):
         gh = with_pr(FakeGh())

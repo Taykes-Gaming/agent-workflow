@@ -48,7 +48,8 @@ board's field settings, which keeps existing values. Re-run `wf fields
 ## 3. Status options
 
 Every board has a built-in Status field, with `Todo`, `In Progress` and
-`Done` options; `gh` cannot edit them, so this step is one GraphQL call. It
+`Done` options; `gh` cannot edit them, so this step is one GraphQL call, in both `api`
+modes: `gh` has no REST route for it, and that tool is not ours to change. It
 **replaces** the options: on a board that already has items, each item's
 Status is cleared, and `wf rebuild` restores Done/Ready/Backlog from issue
 state afterwards. To keep an existing option (and the items set to it),

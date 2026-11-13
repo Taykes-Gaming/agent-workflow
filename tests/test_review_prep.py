@@ -1,5 +1,9 @@
 import importlib.util
+import json
+import os
+import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 _path = Path(__file__).resolve().parent.parent / "plugins" / "wf-review" / "scripts" / "review_prep.py"
@@ -115,3 +119,186 @@ if __name__ == "__main__":
             self.assertEqual(run.call_args.args[0][-1], "a.py")  # README.md is not a seed
         with mock.patch.object(prep.shutil, "which", return_value=None):
             self.assertEqual(prep._map(out, ["a.py"], "2222222"), (None, "wf is not installed"))
+
+
+class ApiModeTest(unittest.TestCase):
+    def config(self, text):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        path = Path(d.name) / ".workflow.toml"
+        path.write_text(text)
+        return str(path)
+
+    def mode(self, flag=None, config=None):
+        env = {"WF_CONFIG": config} if config else {}
+        with mock.patch.dict(os.environ, env):
+            if not config:
+                os.environ.pop("WF_CONFIG", None)
+            return prep.api_mode(flag)
+
+    def test_api_flag_wins(self):
+        self.assertEqual(self.mode("graphql", self.config('api = "rest"\n')), "graphql")
+
+    def test_api_from_config(self):
+        self.assertEqual(self.mode(config=self.config('api = "graphql"\n')), "graphql")
+        self.assertEqual(self.mode(config=self.config('x = 1\n')), "rest")
+
+    def test_api_no_config_is_rest(self):
+        with tempfile.TemporaryDirectory() as d:
+            cwd = os.getcwd()
+            os.chdir(d)
+            try:
+                self.assertEqual(self.mode(), "rest")
+            finally:
+                os.chdir(cwd)
+
+    def test_api_bad_value_exits(self):
+        path = self.config('api = "soap"\n')
+        with self.assertRaises(SystemExit) as cm:
+            self.mode(config=path)
+        self.assertIn(path, str(cm.exception))
+        self.assertIn("'soap'", str(cm.exception))
+
+    def test_api_unparsable_config_exits(self):
+        path = self.config("api = \n")
+        with self.assertRaises(SystemExit) as cm:
+            self.mode(config=path)
+        self.assertIn(path, str(cm.exception))
+
+    def test_api_missing_wf_config_exits(self):
+        with self.assertRaises(SystemExit) as cm:
+            self.mode(config="/nonexistent/.workflow.toml")
+        self.assertIn("/nonexistent/.workflow.toml", str(cm.exception))
+
+    def test_api_in_stop_prep(self):
+        with tempfile.TemporaryDirectory() as d:
+            pr = {"title": "t", "state": "closed", "merged": False}
+            with mock.patch.object(prep, "_gh", side_effect=lambda path, **k: pr if "pulls" in path else []):
+                prep.main(["5", "--repo", "o/r", "--dir", d, "--api", "graphql"])
+            data = json.loads((Path(d) / "prep.json").read_text())
+        self.assertEqual((data["stop"], data["api"]), ("closed", "graphql"))
+
+
+GATES = {"always": True, "issue_or_claude_md": True, "history": False}
+
+
+class LanesTest(unittest.TestCase):
+    def run_prep(self, *argv, config="", issue=None, additions=1, deletions=0, history=False, state="open"):
+        """prep.json from main on PR 12 (closing #7 when `issue` is given), with `config` as the --config file."""
+        d = Path(tempfile.mkdtemp())
+        (d / "c.toml").write_text(config)
+        pr = {"title": "t", "state": state, "body": "Closes #7" if issue else "", "head": {"sha": "abc1234"},
+              "base": {"sha": "base000"}, "additions": additions, "deletions": deletions}
+
+        def gh(path, accept=None, paginate=False, optional=False):
+            if path.endswith("/pulls/12") and not accept:
+                return pr
+            if path.endswith("/issues/7"):
+                return issue
+            if path.endswith("/pulls/12/files?per_page=100"):
+                return [{"filename": "src/a.py", "status": "modified"}]
+            if "/commits?" in path:
+                return [{"sha": "old"}] if history else []
+            return "" if accept else []
+
+        def git(cmd, **kw):
+            return mock.Mock(returncode=0, stdout={"rev-parse": "abc1234\n"}.get(cmd[1], ""), stderr="")
+
+        with mock.patch.object(prep, "_gh", side_effect=gh), mock.patch.object(prep.subprocess, "run", side_effect=git), \
+                mock.patch.object(prep.shutil, "which", return_value=None), mock.patch("builtins.print"):
+            prep.main(["12", "--repo", "o/r", "--dir", str(d / "out"), "--config", str(d / "c.toml"), *argv])
+        return json.loads((d / "out" / "prep.json").read_text())
+
+    def names(self, review, tier, **gates):
+        return [x["name"] for x in prep.resolve_lanes(review, tier, {**GATES, **gates})]
+
+    def test_default_lanes_match_today(self):
+        today = {"light": ("correctness", "reuse"), "standard": ("correctness", "spec", "reuse", "history?"),
+                 "deep": ("correctness", "spec", "reuse", "history"), "fix": ("correctness",)}
+        for tier, lanes in today.items():
+            for history in (True, False):
+                for issue in (True, False):
+                    # wf review's old _lanes(), then the recipe's "skip spec if there is no issue and no CLAUDE.md"
+                    want = [x.rstrip("?") for x in lanes if not x.endswith("?") or history]
+                    want = [x for x in want if x != "spec" or issue]
+                    self.assertEqual(self.names({}, tier, issue_or_claude_md=issue, history=history), want,
+                                     (tier, history, issue))
+        issue = {"title": "T", "body": "", "labels": []}
+        data = self.run_prep(issue=issue, history=True)
+        self.assertEqual((data["tier"], [x["name"] for x in data["lanes"]]),
+                         ("standard", ["correctness", "spec", "reuse", "history"]))
+        self.assertEqual(data["lanes"][0], {"name": "correctness", "brief": prep.BUILTIN_LANES["correctness"]["brief"],
+                                            "model": None, "opencode_model": None})
+        self.assertEqual([x["name"] for x in self.run_prep()["lanes"]], ["correctness", "reuse"])
+
+    def test_custom_lane_added_and_removed(self):
+        data = self.run_prep("--tier", "deep", config='[review.lanes.security]\nbrief = "Find injection."\n'
+                                                      '[review.tiers]\ndeep = ["correctness", "security"]\n')
+        self.assertEqual(data["lanes"], [
+            {"name": "correctness", "brief": prep.BUILTIN_LANES["correctness"]["brief"], "model": None,
+             "opencode_model": None},
+            {"name": "security", "brief": "Find injection.", "model": None, "opencode_model": None}])
+
+    def test_builtin_override_keeps_other_keys(self):
+        review = {"lanes": {"reuse": {"model": "haiku"}, "spec": {"opencode_model": "openai/gpt-6"}}}
+        lanes = {x["name"]: x for x in prep.resolve_lanes(review, "standard", GATES)}
+        self.assertEqual(lanes["reuse"], {"name": "reuse", "brief": prep.BUILTIN_LANES["reuse"]["brief"],
+                                          "model": "haiku", "opencode_model": None})
+        self.assertEqual(lanes["spec"]["brief"], prep.BUILTIN_LANES["spec"]["brief"])
+        # spec keeps its issue_or_claude_md gate
+        self.assertNotIn("spec", self.names(review, "standard", issue_or_claude_md=False))
+
+    def test_question_mark_gate(self):
+        review = {"tiers": {"standard": ["correctness", "history?"], "deep": ["correctness", "history"]}}
+        self.assertEqual(self.names(review, "standard", history=False), ["correctness"])
+        self.assertEqual(self.names(review, "standard", history=True), ["correctness", "history"])
+        self.assertEqual(self.names(review, "deep", history=False), ["correctness", "history"])
+
+    def test_standalone_tier_from_size_label(self):
+        issue = {"title": "T", "body": "", "labels": [{"name": "effort:L"}]}
+        self.assertEqual(self.run_prep(issue=issue, config="[review]\ntiered = true\n")["tier"], "deep")
+        self.assertEqual(self.run_prep(issue=issue, config='[review]\ntiered = true\n[labels]\nsize_prefix = "size/"\n',
+                                       additions=100)["tier"], "light")  # no size/ label: by the diff
+        self.assertEqual(self.run_prep("--tier", "light", issue=issue, config="[review]\ntiered = true\n")["tier"],
+                         "light")
+
+    def test_standalone_tier_from_diff(self):
+        self.assertEqual(self.run_prep(config="[review]\ntiered = true\n", additions=150, deletions=50)["tier"],
+                         "standard")
+        self.assertEqual(self.run_prep(config="[review]\ntiered = false\n", additions=900)["tier"], "standard")
+        self.assertEqual(self.run_prep(additions=900)["tier"], "standard")
+
+    def test_fix_round_uses_fix_list(self):
+        data = self.run_prep("--since", "old5678", "--tier", "deep")
+        self.assertEqual((data["tier"], [x["name"] for x in data["lanes"]]), ("fix", ["correctness"]))
+        data = self.run_prep("--since", "old5678", config='[review.tiers]\nfix = ["correctness", "reuse"]\n')
+        self.assertEqual([x["name"] for x in data["lanes"]], ["correctness", "reuse"])
+
+    def test_stopped_prep_has_no_tier_or_lanes(self):
+        data = self.run_prep(state="closed")
+        self.assertEqual(data["stop"], "closed")
+        self.assertNotIn("tier", data)
+        self.assertNotIn("lanes", data)
+
+    def test_lane_config_errors(self):
+        review = {"lanes": {"security": {},  # missing_brief
+                            "perf": {"brief": "b", "when": "sometimes"},  # bad_when
+                            "style": {"brief": "b", "model": "gpt"},  # bad_model
+                            "docs": {"brief": "b", "colour": "red"}},  # unknown_key
+                  "tiers": {"deep": ["correctness", "secrity"],  # unknown_lane
+                            "huge": ["correctness"],  # bad_tier
+                            "light": [],  # empty_tier
+                            "standard": ["correctness", "reuse?", "reuse"]}}  # duplicate_lane
+        errors = prep.lane_config_errors(review)
+        self.assertEqual(sorted(e.split(": ")[0] for e in errors),
+                         sorted(["missing_brief", "bad_when", "bad_model", "unknown_key", "unknown_lane", "bad_tier",
+                                 "empty_tier", "duplicate_lane"]))
+        self.assertIn("unknown_lane: [review.tiers].deep: no lane named 'secrity'", errors)
+        self.assertEqual(prep.lane_config_errors({}), [])
+        self.assertEqual(prep.lane_config_errors({
+            "lanes": {"security": {"brief": "Find injection.", "when": "history", "model": "opus",
+                                   "opencode_model": "anthropic/claude-opus-5-5"}, "reuse": {"model": "haiku"}},
+            "tiers": {"deep": ["correctness", "security?", "reuse"], "fix": ["correctness"]}}), [])
+        with self.assertRaises(SystemExit) as cm:
+            self.run_prep(config='[review.tiers]\ndeep = ["correctness", "secrity"]\n')
+        self.assertIn("unknown_lane: [review.tiers].deep: no lane named 'secrity'", str(cm.exception))

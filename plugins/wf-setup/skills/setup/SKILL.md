@@ -49,7 +49,11 @@ Infer what you can before asking:
 Then ask the user, in one AskUserQuestion call, only what is still open:
 new board or existing (and its URL); any other repos on the same board, with
 short aliases; whether to track deploys; and confirmation of the inferred
-gate and base branch.
+gate and base branch. Ask once which GitHub API the agents may use, `rest`
+(recommended: the GraphQL rate budget is shared across sessions) or
+`graphql`; infer nothing for it. It fills `{{API}}`. When an existing
+`.workflow.toml` has no `api` key, leave the file alone and say the default
+is `rest`.
 
 ## 3. The board
 
