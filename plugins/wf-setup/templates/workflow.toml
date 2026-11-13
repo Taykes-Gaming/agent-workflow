@@ -1,0 +1,63 @@
+# .workflow.toml: read by `wf` (agent-workflow). Commit it at the repo root.
+
+[board]
+owner = "{{OWNER}}"         # the board owner's login
+owner_type = "{{OWNER_TYPE}}"  # user | org
+number = {{BOARD_NUMBER}}   # from the board URL: …/projects/<number>
+
+[repos]                     # alias → owner/name; refs are <alias>#<n>
+{{ALIAS}} = "{{REPO}}"
+
+[fields]                    # board field names, as created by docs/setup.md
+status = "Status"
+size = "Size"
+model = "Model"
+findings = "Review Findings"
+rounds = "Fix Rounds"
+ktokens = "Agent kTokens"
+turns = "Turns"
+cache_ktokens = "Cache kTokens"   # optional: agent cache reads, from the ledger (wf hook)
+review_ktokens = "Review kTokens" # optional: wf review spend, from the ledger
+# deploy = "Deploy"         # optional: uncomment if you track deploys
+# release = "Release"       # optional
+
+[status]                    # verb → Status option name
+backlog = "Backlog"
+ready = "Ready"
+progress = "In progress"
+blocked = "Blocked"
+review = "In review"
+done = "Done"
+
+[labels]
+backlog = "backlog"
+size_prefix = "effort:"
+deploy_prefix = "deploy:"
+
+# [review]                  # optional defaults for `wf review`
+# level = "high"
+# model = "opus"
+# budget_usd = 6
+# tiered = true              # review depth from the issue's size label (light/standard/deep)
+# engine = "claude"          # or "opencode" (2.1+): the wf-review recipe under opencode
+# opencode_model = "anthropic/claude-sonnet-5-5"
+# lane_model = "anthropic/claude-haiku-4-5"
+
+# [gate]                    # `wf gate`: the local gate, one line per step, full logs in .git/wf-gate/
+# steps = ["dotnet format --verify-no-changes", "dotnet test"]
+# base = "dev"               # changed files for [gate.when] are measured against origin/<base>
+# [gate.when]               # steps run only when a changed file matches the glob (* crosses /)
+# "unity/*" = [{ run = "unity test ./unity --mode EditMode", name = "EditMode", xml = "unity/results.xml" }]
+
+# [opencode]                # optional defaults for `wf dispatch --engine opencode` (opencode 2.1+)
+# model = "anthropic/claude-sonnet-5-5"   # provider/model, as `opencode models` lists them
+# variant = "medium"         # provider reasoning effort, passed as provider/model#variant
+# base = "dev"               # the branch issues are cut from
+# contract = ".claude/agents/implementer.md"  # the implementer text, read from the new worktree
+
+# [map]                     # `wf map`: a ranked map of the definitions around a seed (docs/map.md)
+# budget = 2000              # tokens per map
+# languages = ["csharp", "python"]  # of: python csharp typescript tsx javascript go (default: all)
+# scip = "index.scip"        # SCIP index(es), a path or a list: resolved references for the files they cover
+# index = ["scip-dotnet index", { run = "scip-python index tools --output tools/index.scip", out = "tools/index.scip" }]  # what `wf index` runs; out: the index an entry writes
+# env = { DOTNET_ROLL_FORWARD = "Major" }  # added to every index command

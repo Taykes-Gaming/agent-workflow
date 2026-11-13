@@ -1,0 +1,19 @@
+{
+  "name": "agent-workflow",
+  "owner": {
+    "name": "Taykes-Gaming"
+  },
+  "description": "Plugins for the shared Claude Code issue workflow",
+  "plugins": [
+    {
+      "name": "wf-setup",
+      "source": "./plugins/wf-setup",
+      "description": "Set up agent-workflow in a repository: the Projects board, .workflow.toml, the workflow docs, the implementer agent and the GitHub templates"
+    },
+    {
+      "name": "wf-review",
+      "source": "./plugins/wf-review",
+      "description": "Lean pull-request review: scripted prep, 2-3 parallel lanes, severity and likelihood scored in-session, one comment"
+    }
+  ]
+}

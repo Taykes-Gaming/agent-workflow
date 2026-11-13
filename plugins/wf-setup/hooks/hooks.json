@@ -1,0 +1,19 @@
+{
+  "description": "Record each implementer subagent and main session in wf's per-branch spend ledger (wf hook); wf merged and wf spend read it",
+  "hooks": {
+    "SubagentStop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "wf hook", "timeout": 5 }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "wf hook", "timeout": 5 }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "name": "wf-setup",
+  "version": "0.2.0",
+  "description": "Set up agent-workflow in a repository (the Projects board, .workflow.toml, the workflow docs, the implementer agent and the GitHub templates), a one-screen process skill, and the SubagentStop and Stop hooks that record spend in wf's ledger",
+  "author": {
+    "name": "Taykes-Gaming"
+  },
+  "license": "Apache-2.0"
+}

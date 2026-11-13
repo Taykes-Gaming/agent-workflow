@@ -1,0 +1,9 @@
+{
+  "name": "wf-review",
+  "version": "0.1.0",
+  "description": "Lean pull-request review: scripted prep, 2-3 parallel lanes, severity and likelihood scored in the orchestrating session, one comment",
+  "author": {
+    "name": "Taykes-Gaming"
+  },
+  "license": "Apache-2.0"
+}
