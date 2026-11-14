@@ -1,21 +1,17 @@
 ---
-allowed-tools: Bash(python3:*), Bash(gh api:*), Bash(git log:*), Bash(git blame:*), Bash(git show:*), Bash(git diff:*), Bash(ast-grep run:*), Read, Write, Grep, Glob, Agent
-argument-hint: <PR number> [--no-post] [--out FILE] [--force] [--since SHA --previous FILE]
-description: Lean PR review — scripted prep, 2–4 parallel lanes, scoring in this session, one comment
+allowed-tools: Bash(python3:*), Bash(gh api:*), Bash(gh pr view:*), Bash(gh pr diff:*), Bash(gh issue view:*), Bash(git log:*), Bash(git blame:*), Bash(git show:*), Bash(git diff:*), Bash(ast-grep run:*), Read, Write, Grep, Glob, Agent
+argument-hint: <PR number> [--no-post] [--out FILE] [--force] [--since SHA --previous FILE] [--api rest|graphql] [--config PATH] [--tier light|standard|deep]
+description: Lean PR review — scripted prep, parallel lanes, scoring in this session, one comment
 ---
 
 Review pull request $ARGUMENTS with the wf-review recipe. Run it from a session that did **not** write the change; if this session wrote it, say so in the comment's footer.
 
-Be economical: no agents except the lanes in step 2, no re-fetching what prep already wrote, and REST only (`gh api …`; never `gh pr …`, `gh issue …` or `gh api graphql`).
+Be economical: no agents except the lanes in step 2, no re-fetching what prep already wrote, and REST only (`gh api …`; never `gh pr …`, `gh issue …` or `gh api graphql`) unless prep.json's `api` is `graphql`, which also allows `gh pr view`, `gh pr diff` and `gh issue view`; `gh api graphql` is never used (#80 Design 4a).
 
-1. **Prep (no agents).** Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/review_prep.py" <PR>` (append `--force`, `--since SHA` and `--previous FILE` if they were given) and read the `prep.json` it prints.
+1. **Prep (no agents).** Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/review_prep.py" <PR>` (append `--force`, `--since SHA`, `--previous FILE`, `--api rest|graphql`, `--config PATH` and `--tier light|standard|deep` if they were given) and read the `prep.json` it prints.
    - If `stop` is set and `--force` was not given, report the reason in one line and stop.
-   - Note `diff`, `issue.path`, `claude_md`, `history_lane`, `lint`, `since`, `tools` and `map` (a `wf map` around the changed files, or null with the reason in `map_skipped`). If `since` is set this is a **fix round**: run only the correctness lane. If `claude_md_incomplete` is true (GitHub truncated the tree), tell the spec lane to find CLAUDE.md files with Glob in the checkout.
-2. **Lanes.** In **one** message, launch these `wf-review:review-lane` agents in parallel (correctness only in a fix round). Give each its lane name, the prep directory (`dir` in prep.json), whether `map` is set, and the lane brief below:
-   - **correctness**: read `diff.patch` and the changed functions in full; find bugs the change introduces (logic, error paths, state, ordering, resource handling).
-   - **spec**: read `issue.md` and the CLAUDE.md files listed in prep; find places where the change contradicts the issue's design, numbers or constraints, misses something it requires, or breaks a house rule a CLAUDE.md states explicitly (quote the rule). Skip this lane if there is no issue and no CLAUDE.md.
-   - **history**, only if `history_lane` is true: read the history of the touched files (`git log -p` on them, the review comments on PRs that last touched them via `gh api`), plus any code the issue says this change replaces or ports. Find behaviour the old code or past reviews handled that this change regresses.
-   - **reuse**: for each function, type, constant, helper or non-trivial block the diff adds, find an existing equivalent in the codebase that it should have used instead (ast-grep when `tools.ast_grep` is true). Report duplication, not defects.
+   - Note `diff`, `issue.path`, `claude_md`, `lint`, `since`, `tools`, `map` (a `wf map` around the changed files, or null with the reason in `map_skipped`) and `lanes`, the lanes to run, already chosen for the review's `tier` (a fix round's when `since` is set). If `claude_md_incomplete` is true (GitHub truncated the tree), tell a spec lane, if one runs, to find CLAUDE.md files with Glob in the checkout.
+2. **Lanes.** In **one** message, launch one `wf-review:review-lane` agent per entry of prep.json's `lanes`, in parallel, and no others. Give each its lane `name`, the prep directory (`dir` in prep.json), whether `map` is set, and its `brief`; when the entry's `model` is set, pass it as the Agent call's model.
 3. **Score here (no agents).** Collect the lanes' findings and merge duplicates. For each finding, open the cited code yourself and confirm or refute it:
    - **Dropped:** false, pre-existing, a lint or style matter, or an intended behaviour the issue asks for; for reuse, the existing code does not really do the same job. Keep one line saying why.
    - Otherwise keep the lane's severity and likelihood, correcting either if the code shows it wrong.
@@ -46,7 +42,7 @@ Be economical: no agents except the lanes in step 2, no re-fetching what prep al
    - <title> — <why>
    </details>
 
-   Lanes: <lanes run>. Prep: <additions>+/<deletions>- in <n> files.< Fix round since <short sha>.>
+   Lanes: <the names in prep's lanes>. Prep: <additions>+/<deletions>- in <n> files.< Fix round since <short sha>.>
    ```
 
    Links are `https://github.com/<repo>/blob/<head sha>/<path>#L<a>-L<b>`, with the full sha from prep and at least one line of context either side. Write `none` under an empty section. No emojis.

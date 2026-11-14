@@ -5,6 +5,8 @@ per run (`board.Board`), never written down: rewriting a single-select field's
 options regenerates every option id.
 """
 
+import functools
+import importlib.util
 import os
 import re
 import tomllib
@@ -18,12 +20,14 @@ STATUS_VERBS = ("backlog", "ready", "progress", "blocked", "review", "done")
 REQUIRED_FIELDS = ("status", "size", "model", "findings", "rounds", "ktokens")
 OPTIONAL_FIELDS = ("turns", "cache_ktokens", "review_ktokens", "deploy", "release")
 LEVELS = ("low", "medium", "high", "xhigh", "max")  # wf review --level
+APIS = ("rest", "graphql")  # the top-level `api`
 ENGINES = ("claude", "opencode")  # wf review --engine
 OPENCODE_KEYS = ("model", "variant", "base", "contract")  # [opencode], for wf dispatch
 GATE_KEYS = ("steps", "when", "base")  # [gate], for wf gate
 MAP_KEYS = ("budget", "scip", "index", "languages", "base", "env", "common")  # [map], for wf map / wf index
 WAIT_KEYS = ("until", "fail", "timeout", "run", "file", "context")  # a [wait.<name>] preset, for wf wait
 STEP_KEYS = ("run", "name", "xml")  # a [gate] step written as a table
+ASSETS = Path(__file__).resolve().parent / "review_assets"  # wf-review's prompts and prep script, shipped with wf
 _REF = re.compile(r"^(?:(?P<alias>[A-Za-z0-9_.-]+)|(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+))#(?P<n>[0-9]+)$")
 
 
@@ -47,7 +51,8 @@ class Config:
     status: dict  # verb → option name
     labels: dict
     path: Path
-    review: dict = field(default_factory=dict)  # [review]: level, model, budget_usd, engine, opencode_model, lane_model, tiered; defaults in commands.review
+    api: str = "rest"  # which GitHub API the agents may use: "rest" or "graphql" (lifts the GraphQL bans)
+    review: dict = field(default_factory=dict)  # [review]: level, model, budget_usd, engine, opencode_model, lane_model, tiered, lanes, tiers; defaults in commands.review
     opencode: dict = None  # [opencode]: model, variant, base, contract; defaults in commands.dispatch
     gate: dict = None  # [gate], normalised: {steps: [step], when: {glob: [step]}, base}; step = {run, name, xml}
     map: dict = None  # [map]: budget, scip, index, languages, base, env, common; defaults in commands.map
@@ -73,6 +78,16 @@ class Config:
             if full.lower() == repo.lower():
                 return f"{alias}#{number}"
         return f"{repo}#{number}"
+
+
+@functools.cache
+def review_prep():
+    """The wf-review plugin's review_prep.py (symlinked into ASSETS) as a module: wf takes its tier and lane rules
+    from there, so they live in one file the plugin also runs without wf."""
+    spec = importlib.util.spec_from_file_location("wf_review_prep", ASSETS / "review_prep.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def find():
@@ -115,6 +130,9 @@ def load(path=None):
                     raise WfError(f"{path}: [{name}].{k} must be a string, not {type(v).__name__}")
         return dict(value)
 
+    api = raw.get("api", "rest")
+    if not isinstance(api, str) or api not in APIS:
+        raise WfError(f'{path}: api must be "rest" or "graphql", not {api!r}')
     board = section("board")
     owner_type = need(board, "owner_type", "[board]")
     if owner_type not in ("user", "org"):
@@ -143,7 +161,8 @@ def load(path=None):
     if not isinstance(raw.get("review", {}), dict):
         raise WfError(f"{path}: [review] must be a table")
     review = dict(raw.get("review") or {})
-    unknown = set(review) - {"level", "model", "budget_usd", "engine", "opencode_model", "lane_model", "tiered"}
+    unknown = set(review) - {"level", "model", "budget_usd", "engine", "opencode_model", "lane_model", "tiered",
+                             "lanes", "tiers"}
     if unknown:
         raise WfError(f"{path}: unknown [review] keys: {', '.join(sorted(unknown))}")
     if "budget_usd" in review and not _number(review["budget_usd"], above=0):
@@ -157,6 +176,10 @@ def load(path=None):
         raise WfError(f"{path}: [review].tiered must be true or false")
     if review.get("engine", "claude") not in ENGINES:
         raise WfError(f"{path}: [review].engine must be claude or opencode")
+    if "lanes" in review or "tiers" in review:
+        errors = review_prep().lane_config_errors(review)
+        if errors:
+            raise WfError("\n".join(f"{path}: {e}" for e in errors))
     if not isinstance(raw.get("opencode", {}), dict):
         raise WfError(f"{path}: [opencode] must be a table")
     opencode = section("opencode", required=False)
@@ -175,6 +198,7 @@ def load(path=None):
         status=status,
         labels=labels,
         path=path,
+        api=api,
         review=review,
         opencode=opencode,
         gate=gate,

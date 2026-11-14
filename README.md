@@ -7,7 +7,8 @@ GitHub Projects v2 board:
   agent metrics (model, review findings, fix rounds, tokens, turns) and
   reports on them. It works through the **REST** API, which has a separate
   rate budget from GraphQL; `wf` makes one GraphQL call, as a fallback.
-  Every action prints one line.
+  `wf` itself always uses REST; the `api` setting decides what the agents
+  and reviewers may use. Every action prints one line.
 - **`wf review`** and the **`wf-review`** plugin: a pull-request review gate
   that runs in a fresh session, so the reviewer never sees the author's
   context.
@@ -90,6 +91,8 @@ the first time `wf` adds it. To pick the colours, create the labels first.
 or the file named by `WF_CONFIG`.
 
 ```toml
+api = "rest"            # rest | graphql: which GitHub API the agents may use (default rest)
+
 [board]
 owner = "your-org"      # login
 owner_type = "org"      # user | org  → /users/… or /orgs/…
@@ -125,6 +128,12 @@ backlog = "backlog"
 size_prefix = "effort:"
 deploy_prefix = "deploy:"
 fix_prefix = "fix-"     # optional: wf board warns on a fix-N stream past its cap
+
+# [review.tiers]        # optional: the wf-review lanes per tier (see Custom lanes); each lane adds spend
+# light = ["correctness", "reuse"]
+# standard = ["correctness", "spec?", "reuse", "history?"]
+# deep = ["correctness", "spec?", "reuse", "history"]
+# fix = ["correctness"]
 ```
 
 Commit `.workflow.toml` at the root of the repo the architect works from. A
@@ -133,6 +142,7 @@ board that spans several repos needs the file in only one of them; set
 
 | Key | Required | Meaning |
 |---|---|---|
+| `api` | no | `rest` (default) or `graphql`: which GitHub API the agents may use ([REST or GraphQL](#rest-or-graphql)). |
 | `board.owner`, `board.owner_type`, `board.number` | yes | The board: `/users/<owner>/projectsV2/<n>` or `/orgs/<owner>/projectsV2/<n>`. |
 | `repos.<alias>` | no | Short names for refs. `owner/name#<n>` works without one. |
 | `fields.status` … `fields.ktokens` | yes | Names of the board's fields. |
@@ -152,6 +162,38 @@ field's options regenerates every option id. A name that is not on the board
 fails with the list of valid ones. Deploy options are named `n/a`, `Pending`,
 `Staging` and `Production`; sizes are `XS` `S` `M` `L` `XL`.
 
+### REST or GraphQL
+
+The top-level `api` key picks which GitHub API the agents and reviewers may
+use: `"rest"` (the default) or `"graphql"`. It is one switch, with no
+per-surface overrides, and it is read by the tools themselves, so it applies
+whether or not `wf` launched them.
+
+- **`rest`** keeps the GraphQL bans: it is the default because the GraphQL
+  rate budget is shared across sessions, and agents reading pull requests
+  with `gh pr view` can exhaust it.
+- **`graphql`** only lifts the read-only bans: `wf review --engine opencode`
+  lets its agents run `gh pr view`, `gh pr diff` and `gh issue view` (the
+  `gh api` write denials stay), and the `wf-review` plugin and the review
+  prompts do the same (`gh pr view`, `gh pr diff`, `gh issue view`, never raw
+  `gh api graphql`). `--web`/`-w` on `gh pr view` and `gh issue view` is
+  denied by `wf review` in both engines and both modes. `wf` gets no GraphQL client; it stays
+  REST, with its one `add_item` fallback, in both modes.
+
+Two calls stay GraphQL in both modes, because the tool that makes them is not
+ours to change: the setup call that sets Status's options (`gh` has no REST
+route for it), and Claude Code's built-in `/code-review`, which the Claude
+engine of `wf review` runs and which reads the PR with `gh pr view` and `gh pr
+diff`. The Claude engine's tool lists do not change with `api`.
+
+A third exception runs the other way: raw `gh api graphql` stays denied for
+review agents in both modes, because a glob cannot tell a query from a
+mutation (shell quoting or `$(<file)` defeats a `*mutation*` deny), so
+allowing it would let a PR steer a review agent into writing.
+
+Some GitHub Enterprise Server instances lack REST routes, so `rest` mode may
+fail there; set `api = "graphql"` on those.
+
 ## Refs
 
 `<alias>#<n>` (`app#157`) or `owner/name#<n>`
@@ -165,7 +207,7 @@ The board's item listing lags an add by up to ~11 minutes, and adding an
 issue that is already on the board fails with `422 Content already exists in
 this project`. On exactly that error, `wf` asks the issue for its project
 items with one GraphQL query and uses the item on the configured board. This
-is `wf`'s only GraphQL call. The GraphQL budget is shared across sessions,
+is `wf`'s only GraphQL call, in both `api` modes. The GraphQL budget is shared across sessions,
 so it is used only on this path.
 
 ## Commands
@@ -272,8 +314,9 @@ This repo is also a Claude Code plugin marketplace. Its `wf-review` plugin is
 a lean pull-request review:
 - **Prep:** a script gathers the PR, diff, linked issue, CLAUDE.md files and
   file history over REST, with no agents.
-- **Lanes:** 2–3 parallel Sonnet agents (correctness, spec, history) with
-  Read, Grep, Glob and Bash, told to read only and to use REST.
+- **Lanes:** parallel Sonnet agents (by default correctness, spec, reuse and
+  history; [custom lanes](#custom-lanes) change them) with Read, Grep, Glob
+  and Bash, told to read only and to use REST.
 - **Scoring:** the orchestrating session scores each finding for severity and
   likelihood separately.
 - **Output:** one comment with Report and Noted findings.
@@ -285,6 +328,14 @@ claude plugin install wf-review@agent-workflow
 
 Run `/wf-review:review <pr>` from a session that did not write the change.
 `--no-post --out FILE` writes the review to a file instead of posting it.
+The recipe allows GraphQL reads (`gh pr view`, `gh pr diff`, `gh issue view`)
+only in `graphql` mode; `--api rest|graphql` overrides `api` in
+`.workflow.toml`, and `wf review` passes the mode explicitly.
+A standalone run picks its tier, and so its lanes, like `wf review`:
+`--tier light|standard|deep`, else with `tiered = true` the linked issue's
+size label or the diff's changed lines, else standard. `--config PATH` names
+the config file (default: `WF_CONFIG`, else the first `.workflow.toml` up from
+the current directory); `wf review` passes the one it read.
 
 ### `wf review <pr>`
 
@@ -339,14 +390,62 @@ one; with `tiered = true` under `[review]`, wf reads the size label
 (`effort:XS`…) on the issue the PR closes, or goes by the diff's changed lines
 when there is none (up to 150 light, up to 800 standard, more deep):
 
-| Tier | Sizes | Claude engine | opencode lanes |
+| Tier | Sizes | Claude engine | default lanes |
 |---|---|---|---|
 | light | XS, S | `/code-review` at `medium` | correctness, reuse |
-| standard | M | at the configured level (`high`) | correctness, spec, reuse, history when there is history |
-| deep | L, XL | at `xhigh` | correctness, spec, reuse, history |
+| standard | M | at the configured level (`high`) | correctness, spec when there is an issue or CLAUDE.md, reuse, history when there is history |
+| deep | L, XL | at `xhigh` | correctness, spec when there is an issue or CLAUDE.md, reuse, history |
 
 `--level` still wins over the tier. Without `--tier` or `tiered`, wf behaves
 as before (standard).
+
+**Custom lanes.** The lanes the wf-review recipe runs (under opencode, with
+`--lean`, in a fix round, or as `/wf-review:review`) are configurable per
+tier. Each lane is a subagent run and adds to every review's spend; there is
+no cap.
+
+```toml
+[review.lanes.security]     # a new lane, or a built-in name to override any of its keys
+brief = "find injection, authorization and secret-handling bugs the change introduces"
+when = "always"             # always | issue_or_claude_md | history
+model = "opus"              # optional: the Claude recipe's lane model (sonnet | opus | haiku | fable)
+opencode_model = "anthropic/claude-opus-5-5"  # optional: the opencode engine's provider/model
+
+[review.tiers]              # each lane is a subagent run and adds to every review's spend
+light = ["correctness", "reuse"]
+standard = ["correctness", "spec?", "reuse", "history?"]
+deep = ["correctness", "spec?", "reuse", "history", "security"]
+fix = ["correctness"]
+```
+
+- The built-in lanes are `correctness` and `reuse` (`when = "always"`), `spec`
+  (`issue_or_claude_md`: the PR links an issue or a CLAUDE.md applies) and
+  `history` (`history`: the touched files have history, or the issue says the
+  change replaces code). A `[review.lanes.<built-in>]` table overrides only
+  the keys it sets; a new lane needs a `brief`.
+- An entry `name?` runs only when its lane's `when` gate holds; a bare `name`
+  always runs. A fix round reads no history, so the `history` gate is false
+  there and a lane gated on it never runs as `name?` in `fix`. The lists
+  above are the defaults, and a tier left out keeps
+  its default.
+- Two model keys, because the engines name models differently: `model` for
+  the Claude recipe's lane agent, `opencode_model` (`provider/model`) for
+  opencode, where each distinct one gets its own lane agent
+  (`wf-review-lane-1`, …). A lane without one uses the default lane model.
+
+Every `wf` command, and the prep script, rejects a bad lane config, listing
+each error as `<type>: <where>: <message>`:
+
+| Type | When |
+|---|---|
+| `unknown_lane` | a tier entry (without its `?`) is neither built in nor in `[review.lanes]` |
+| `missing_brief` | a lane that is not built in has no `brief`, or `brief` is not a non-empty string |
+| `bad_when` | `when` is not `always`, `issue_or_claude_md` or `history` |
+| `bad_model` | `model` is not `sonnet`, `opus`, `haiku` or `fable`, or `opencode_model` is not `provider/model` |
+| `bad_tier` | a `[review.tiers]` key is not `light`, `standard`, `deep` or `fix`, or its value is not a list of strings |
+| `empty_tier` | a tier list is empty |
+| `duplicate_lane` | a tier list names the same lane twice (ignoring `?`) |
+| `unknown_key` | a lane table has a key other than `brief`, `when`, `model`, `opencode_model`, or `[review.lanes].<name>` is not a table |
 
 **Fix rounds** review only what changed since the last review:
 
@@ -356,8 +455,8 @@ wf review 12 --since last    # after the fixes: only the new commits
 ```
 
 `--since <sha>` names the commit instead. The round's diff is just the new
-commits (the whole PR stays available as context), its only lane is
-correctness, and the review opens with **Previous findings**: each earlier
+commits (the whole PR stays available as context), its lanes are the `fix`
+list (correctness by default), and the review opens with **Previous findings**: each earlier
 finding marked resolved, still open or declined. It always runs the
 `wf-review` recipe (under opencode, or the plugin under Claude, which must be
 installed): the built-in `/code-review` takes no commit range, and when it
@@ -387,17 +486,19 @@ wf review 12 --engine opencode --lane-model anthropic/claude-haiku-4-5
 
 - Needs opencode 2.1 or later; wf checks before it starts.
 - Same worktree at the PR head as the Claude engine. wf runs the prep script
-  itself, then `opencode run --standalone` with two agents passed inline
+  itself, then `opencode run --standalone` with its agents passed inline
   (nothing is written to the checkout): `wf-review`, which launches the lanes
-  and scores, and `wf-review-lane`, the plugin's lane prompt. The run uses a
+  and scores, and `wf-review-lane`, the plugin's lane prompt (plus
+  `wf-review-lane-1`, … for each other lane `opencode_model`). The run uses a
   private server because opencode's shared background service ignores
   inline config.
 - The lanes run in the foreground, in parallel. A private server ends with
   the run, so a lane launched in the background would end before it reports.
   If the orchestrator backgrounds one anyway, the review fails and posts
   nothing; run it again.
-- The agents may read the checkout and run `gh api` (reads only: writes and
-  GraphQL are denied), `git log`, `git blame`, `git show`, `git diff` (not
+- The agents may read the checkout and run `gh api` (reads only: writes are
+  denied, and so is raw `gh api graphql`; `api = "graphql"` adds `gh pr view`,
+  `gh pr diff` and `gh issue view`), `git log`, `git blame`, `git show`, `git diff` (not
   `--output`) and `ast-grep run` (not `-U` or `-i`); nothing else, and no
   edits. The repo's own `AGENTS.md` loads, or its root `CLAUDE.md` when it
   has none (wf passes it as an instruction, since opencode 2 reads only

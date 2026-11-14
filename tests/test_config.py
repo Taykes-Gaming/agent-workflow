@@ -114,6 +114,42 @@ class ConfigTest(unittest.TestCase):
             with self.assertRaises(UsageError, msg=bad):
                 cfg.parse_ref(bad)
 
+    def _load_api(self, line):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "c.toml"
+            p.write_text(line + CONFIG.format(owner_type="user", deploy="", review=""))
+            return config.load(p), p
+
+    def test_api_defaults_to_rest(self):
+        self.assertEqual(self._load_api("")[0].api, "rest")
+
+    def test_api_graphql(self):
+        self.assertEqual(self._load_api('api = "graphql"\n')[0].api, "graphql")
+
+    def test_api_rejects_other_values(self):
+        for line in ('api = "REST"\n', "api = 1\n"):
+            with self.subTest(line=line):
+                with self.assertRaisesRegex(WfError, r'c\.toml: api must be "rest" or "graphql"'):
+                    self._load_api(line)
+
+    def test_review_lane_errors_raise(self):
+        review = ('[review]\ntiered = true\n[review.lanes.security]\nwhen = "never"\n'
+                  '[review.tiers]\nlight = []\ndeep = ["correctness", "secrity"]\n')
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "c.toml"
+            p.write_text(CONFIG.format(owner_type="user", deploy="", review=review))
+            with self.assertRaises(WfError) as cm:
+                config.load(p)
+            lines = str(cm.exception).splitlines()
+            self.assertEqual(lines, [
+                f"{p}: missing_brief: [review.lanes.security]: a lane that is not built in needs a brief",
+                f"{p}: bad_when: [review.lanes.security].when: must be always, issue_or_claude_md, history, not 'never'",
+                f"{p}: empty_tier: [review.tiers].light: names no lanes",
+                f"{p}: unknown_lane: [review.tiers].deep: no lane named 'secrity'"])
+            p.write_text(CONFIG.format(owner_type="user", deploy="", review=(
+                '[review.lanes.security]\nbrief = "Find injection."\n[review.tiers]\ndeep = ["correctness", "security"]\n')))
+            self.assertEqual(config.load(p).review["tiers"], {"deep": ["correctness", "security"]})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -149,7 +149,7 @@ class FakeGh(Gh):
 
 
 @contextlib.contextmanager
-def configured(owner_type="user", deploy=True, review=None, opencode=None, gate=None, fields=""):
+def configured(owner_type="user", deploy=True, review=None, opencode=None, gate=None, fields="", api=None):
     extra = ('deploy = "Deploy"\nrelease = "Release"\n' if deploy else "") + fields
     review = f"[review]\n{review}" if review else ""
     if opencode:
@@ -158,7 +158,7 @@ def configured(owner_type="user", deploy=True, review=None, opencode=None, gate=
         review += f"\n{gate}"
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / ".workflow.toml"
-        path.write_text(CONFIG.format(owner_type=owner_type, deploy=extra, review=review))
+        path.write_text((f'api = "{api}"\n' if api else "") + CONFIG.format(owner_type=owner_type, deploy=extra, review=review))
         with mock.patch.dict(os.environ, {"WF_CONFIG": str(path)}):
             yield path
 
