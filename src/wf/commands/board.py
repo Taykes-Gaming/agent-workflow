@@ -7,6 +7,9 @@ that still has an open issue warns past FIX_CAP issues or FIX_DAYS days since
 its first issue. Without the cache_ktokens and review_ktokens fields, a line
 says what `wf merged` cannot record and how to add them; it is
 a warning only. `--check` exits 1 on drift or a stream past its cap.
+
+With --json each item record carries every configured field by its [fields]
+key (null when the item has none), plus size, status and deploy always.
 """
 
 from datetime import datetime, timezone
@@ -114,6 +117,6 @@ def run(args, cfg, board):
         size = it.values.get("size") or "-"
         status = it.values.get("status") or "-"
         yield f"{shown} {size} {status} {truncate(it.title, TITLE)}", {
-            "ref": shown, "size": it.values.get("size"), "status": it.values.get("status"),
-            "deploy": it.values.get("deploy"), "title": it.title,
+            "ref": shown, **{k: it.values.get(k) for k in ("size", "status", "deploy", *cfg.fields)},
+            "title": it.title,
         }
