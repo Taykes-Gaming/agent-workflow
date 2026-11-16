@@ -293,6 +293,16 @@ class ReadCommandsTest(unittest.TestCase):
         rec = json.loads(run(["board", "--json"], gh)[1].splitlines()[0])["drift"]
         self.assertEqual((len(rec["closed_not_done"]), rec["total"]["closed_not_done"]), (10, 12))
 
+    def test_board_json_records_carry_every_configured_field(self):
+        import json
+        out = run(["board", "--json"], fake_gh.spend_fields(FakeGh()), fields=fake_gh.SPEND_FIELDS)[1]
+        recs = {r["ref"]: r for r in map(json.loads, out.splitlines()) if "ref" in r}
+        self.assertEqual(recs["mobile#12"], {
+            "ref": "mobile#12", "size": "S", "status": "In review", "deploy": "Pending", "model": "sonnet",
+            "findings": 2, "rounds": 1, "ktokens": 410, "turns": 55, "cache_ktokens": None,
+            "review_ktokens": None, "release": None, "title": "Show the lap table on the activity screen",
+        })
+
 
 if __name__ == "__main__":
     unittest.main()
