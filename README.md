@@ -551,7 +551,7 @@ runs several review recipes blind on one PR and records what each cost. Runs lan
    | Template | Goes to | Is |
    |---|---|---|
    | `docs/issue-workflow.md` | `docs/issue-workflow.md` | The implementer's contract: pickup, gate, blocking, PR, comments. |
-   | `docs/sprint-workflow.md` | `docs/sprint-workflow.md` | The architect's guide: planning, model choice, dispatch, the merge gate, metrics, board fields and what "done" means. |
+   | `docs/sprint-workflow.md` | `docs/sprint-workflow.md` | The architect's guide: planning, model choice, dispatch, the architect's own context, the merge gate, metrics, board fields and what "done" means. |
    | `agents/implementer.md` | `.claude/agents/implementer.md` | The six-tool implementer subagent. |
    | `github/PULL_REQUEST_TEMPLATE.md` | `.github/PULL_REQUEST_TEMPLATE.md` | The sections the architect gates on. |
    | `github/ISSUE_TEMPLATE/slice.md`, `sprint-record.md` | `.github/ISSUE_TEMPLATE/` | A dispatch-ready issue; a sprint's record. |

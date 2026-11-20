@@ -29,6 +29,8 @@ only when a step needs it.
 | Open the PR | implementer | PR template, `Closes #<n>`, hand-back comment, then stop |
 | Review the PR | a fresh session | `wf review <pr>` (or the `wf-review` plugin); findings fixed in their own commits or declined in writing |
 | Merge and record | architect, in the merging session | `wf merged <ref> --findings N --rounds N` (sums the PR branch's ledger: agents, then review spend apart; closes the issue) |
+| After the 4th merge in a session | architect | state comment on the sprint record; end the session; the next starts from the record (`docs/sprint-workflow.md` §2a) |
+| Asked what the sprint cost | architect | `wf spend <record>` for its own share, plus the ledger for implementers (§2a) |
 
 # Spending rules
 
@@ -40,3 +42,4 @@ only when a step needs it.
   checkpoint comment, one lever, then pull it.
 - Scope is fixed. Anything the body did not ask for is a follow-up issue.
 - Never rebase or force-push a pushed branch; merge the base in.
+- The architect launches helper subagents on the mid-tier model (the strongest only for a §1a critical-path ruling) and verifies nothing beyond the gate (§3).
