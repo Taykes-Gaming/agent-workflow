@@ -21,7 +21,7 @@ and closed. Amend it as the project learns.
 | Seat | Who | Decides | Never does |
 |---|---|---|---|
 | **Owner** | the human | product rulings, priorities, what a sprint is for | writes issue bodies |
-| **Architect** | an interactive Claude Code session | the issue is the specification: every mechanism, number, test and file reference; order; merge | writes implementation code; starts work on owner feedback that has no issue (§1b) |
+| **Architect** | an interactive Claude Code session | the issue is the specification: every mechanism, number, test and file reference; order; merge | writes implementation code; starts work on owner feedback that has no issue (§1b); verifies a PR beyond the gate (§3) |
 | **Implementer** | a subagent per issue, in its own worktree (`docs/issue-workflow.md`) | nothing outside the body's stated bounds; a gap is a `needs-ruling` comment | changes the specification |
 
 The rule the whole thing rests on: **a decision is made once, in writing, by
@@ -106,6 +106,32 @@ the issue body, so the spec stays the single source), then resume the
 issue's metrics. If an agent died (a network drop), start the replacement with
 the output of `wf checkpoint` run on its branch, so it resumes from the note.
 
+## 2a. The architect's own context
+
+Every turn re-reads the whole session as a cache read, so the architect's
+session length is the sprint's largest cost line, not its output.
+
+- **Helper subagents** (research, reading code, checking a hand-back): launch
+  them with the model set at launch, the mid-tier model (e.g. Sonnet) by
+  default. The strongest model only when the helper's answer is itself a ruling
+  on a §1a critical path. Never leave the model unset: an unset model is the
+  architect's own.
+- **Rollover:** after the 4th merge in one architect session, at the first
+  point where no implementer is in flight (every dispatched agent has handed
+  back and its PR is merged or sent back and returned), the architect writes the
+  sprint's state on the sprint-record issue as a comment (merged, Ready, open
+  rulings) and ends the session. Agent-tool implementers belong to the session
+  that launched them and cannot be messaged from the next one, so the architect
+  dispatches nothing new once the 4th merge is in until it rolls over. The next
+  session starts as §4 item 5 says: from the record issue, then
+  `wf board --check`.
+- **Spend, mid-sprint:** asked what the sprint has cost, the architect counts
+  its own share as well as the implementers': `wf spend <record>` in the
+  checkout it runs in (it recomputes from the transcripts, so running it
+  mid-sprint and again at close never counts twice). This does not include the
+  architect's helper subagents. The implementers' share is the ledger, summed by
+  `wf merged`.
+
 ## 3. The gate (architect, per PR)
 
 Check the PR template's sections **in order**, refusing on the first miss:
@@ -121,6 +147,13 @@ Check the PR template's sections **in order**, refusing on the first miss:
 
 A miss goes back to the same implementer agent by message; each send-back is
 one **fix round**.
+
+The four checks above are the whole gate. The architect runs no verification
+of its own beyond them (the `wf gate` re-run in check 2 is part of them): no extra test
+runs, comparisons or oracles. A check a
+critical path needs is written into the issue's **Tests** at grooming, for the
+implementer to run and paste in the PR; a check found missing at the gate is a
+fix round, not architect work.
 
 Then merge into `{{BASE_BRANCH}}` and, **in the checkout that did the work**,
 record the metrics. A number reconstructed later is a guess:
