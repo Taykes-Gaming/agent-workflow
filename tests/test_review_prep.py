@@ -291,6 +291,13 @@ class LanesTest(unittest.TestCase):
             self.assertEqual((data["stop"], data["stop_overridden"]), (None, "already reviewed"), flags)
             self.assertTrue(data["lanes"], flags)
 
+    def test_since_lifts_only_already_reviewed(self):
+        data = self.run_prep("--since", "old5678", state="closed")
+        self.assertEqual((data["stop"], data["stop_overridden"]), ("closed", None))
+        self.assertNotIn("lanes", data)
+        data = self.run_prep("--since", "old5678", "--force", state="closed")
+        self.assertEqual((data["stop"], data["stop_overridden"]), (None, "closed"))
+
     def test_lane_config_errors(self):
         review = {"lanes": {"security": {},  # missing_brief
                             "perf": {"brief": "b", "when": "sometimes"},  # bad_when
