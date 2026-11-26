@@ -183,7 +183,7 @@ GATES = {"always": True, "issue_or_claude_md": True, "history": False}
 
 
 class LanesTest(unittest.TestCase):
-    def run_prep(self, *argv, config="", issue=None, additions=1, deletions=0, history=False, state="open"):
+    def run_prep(self, *argv, config="", issue=None, additions=1, deletions=0, history=False, state="open", comments=()):
         """prep.json from main on PR 12 (closing #7 when `issue` is given), with `config` as the --config file."""
         d = Path(tempfile.mkdtemp())
         (d / "c.toml").write_text(config)
@@ -195,6 +195,8 @@ class LanesTest(unittest.TestCase):
                 return pr
             if path.endswith("/issues/7"):
                 return issue
+            if "/issues/12/comments" in path:
+                return list(comments)
             if path.endswith("/pulls/12/files?per_page=100"):
                 return [{"filename": "src/a.py", "status": "modified"}]
             if "/commits?" in path:
@@ -279,6 +281,15 @@ class LanesTest(unittest.TestCase):
         self.assertEqual(data["stop"], "closed")
         self.assertNotIn("tier", data)
         self.assertNotIn("lanes", data)
+
+    def test_fix_round_after_a_wf_review_comment_is_not_stopped(self):
+        """The recipe stops on a set `stop`, so a fix round (and --force) must leave it null."""
+        reviewed = [{"body": prep.MARKER + "\n### Review (wf-review)"}]
+        self.assertEqual(self.run_prep(comments=reviewed)["stop"], "already reviewed")
+        for flags in (("--since", "old5678"), ("--force",)):
+            data = self.run_prep(*flags, comments=reviewed)
+            self.assertEqual((data["stop"], data["stop_overridden"]), (None, "already reviewed"), flags)
+            self.assertTrue(data["lanes"], flags)
 
     def test_lane_config_errors(self):
         review = {"lanes": {"security": {},  # missing_brief

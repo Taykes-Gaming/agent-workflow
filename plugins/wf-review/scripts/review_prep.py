@@ -8,7 +8,8 @@ DIR/diff.patch and prints the prep.json path. DIR defaults to
 $TMPDIR/wf-review/<owner>-<name>-<pr>.
 
 prep.json carries `stop`: a reason not to review (closed, draft, already
-reviewed) or null; with --force the rest is gathered anyway. The lanes read the diff and issue from DIR rather than each
+reviewed) or null. With --force or --since the rest is gathered anyway and `stop` is null, so a reader never has to
+know which flags lift it; the reason set aside is in `stop_overridden`. The lanes read the diff and issue from DIR rather than each
 fetching them. When `wf` is installed, DIR/map.md is `wf map` around the
 changed files (prep.json `map`), so a lane starts from the definitions the
 change touches instead of searching for them.
@@ -392,9 +393,10 @@ def main(argv):
 
     pr = _gh(f"/repos/{repo}/pulls/{n}")
     comments = _gh(f"/repos/{repo}/issues/{n}/comments?per_page=100", paginate=True)
-    prep = {"repo": repo, "pr": n, "title": pr["title"], "stop": stop_reason(pr, comments), "dir": str(out),
-            "api": api_mode(a.api, loaded)}
-    if prep["stop"] and not force:
+    stop = stop_reason(pr, comments)
+    prep = {"repo": repo, "pr": n, "title": pr["title"], "stop": None if force else stop,
+            "stop_overridden": stop if force else None, "dir": str(out), "api": api_mode(a.api, loaded)}
+    if prep["stop"]:
         (out / "prep.json").write_text(json.dumps(prep, indent=2))
         print(out / "prep.json")
         return
