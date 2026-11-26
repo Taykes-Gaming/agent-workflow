@@ -8,7 +8,9 @@ DIR/diff.patch and prints the prep.json path. DIR defaults to
 $TMPDIR/wf-review/<owner>-<name>-<pr>.
 
 prep.json carries `stop`: a reason not to review (closed, draft, already
-reviewed) or null; with --force the rest is gathered anyway. The lanes read the diff and issue from DIR rather than each
+reviewed) or null. --force lifts any reason and --since lifts "already reviewed" (a fix round answers that review):
+the rest is then gathered and `stop` is null, so a reader never has to know which flags lift it; the reason set aside
+is in `stop_overridden`. The lanes read the diff and issue from DIR rather than each
 fetching them. When `wf` is installed, DIR/map.md is `wf map` around the
 changed files (prep.json `map`), so a lane starts from the definitions the
 change touches instead of searching for them.
@@ -16,7 +18,7 @@ change touches instead of searching for them.
 --since SHA makes it a fix-round prep: diff.patch holds only the commits after
 SHA (read from the local checkout, which must be at the PR head), pr.patch
 holds the whole PR, and --previous FILE (the review those commits answer) is
-copied in as previous-review.md. --since implies --force: the PR was reviewed.
+copied in as previous-review.md. A closed, merged or draft PR still stops a fix round unless --force is given.
 
 prep.json carries `api`, "rest" or "graphql", which the review prompts read to know whether `gh pr view`,
 `gh pr diff` and `gh issue view` are allowed: --api, else `api` in the config file (--config, else $WF_CONFIG,
@@ -385,16 +387,18 @@ def main(argv):
     errors = lane_config_errors(review)
     if errors:
         sys.exit("\n".join(f"review_prep: {path}: {e}" for e in errors))
-    n, force, out_dir = a.pr, a.force or bool(a.since), a.dir
+    n, out_dir = a.pr, a.dir
     repo = a.repo or _repo_from_git()
     out = Path(out_dir or Path(tempfile.gettempdir()) / "wf-review" / f"{repo.replace('/', '-')}-{n}")
     out.mkdir(parents=True, exist_ok=True)
 
     pr = _gh(f"/repos/{repo}/pulls/{n}")
     comments = _gh(f"/repos/{repo}/issues/{n}/comments?per_page=100", paginate=True)
-    prep = {"repo": repo, "pr": n, "title": pr["title"], "stop": stop_reason(pr, comments), "dir": str(out),
-            "api": api_mode(a.api, loaded)}
-    if prep["stop"] and not force:
+    stop = stop_reason(pr, comments)
+    force = a.force or (bool(a.since) and stop == "already reviewed")
+    prep = {"repo": repo, "pr": n, "title": pr["title"], "stop": None if force else stop,
+            "stop_overridden": stop if force else None, "dir": str(out), "api": api_mode(a.api, loaded)}
+    if prep["stop"]:
         (out / "prep.json").write_text(json.dumps(prep, indent=2))
         print(out / "prep.json")
         return
